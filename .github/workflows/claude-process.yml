@@ -1,0 +1,72 @@
+name: Claude Process Repository Changes
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:  # Allows manual trigger from Actions tab
+
+jobs:
+  detect-and-process:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Get full history for diff
+
+      - name: Get changed files
+        id: changed-files
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            # For push events, compare with previous commit
+            if [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+              CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }})
+            else
+              # For initial commit
+              CHANGED_FILES=$(git ls-tree -r --name-only HEAD)
+            fi
+          else
+            # For manual trigger, get latest changes
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+          fi
+          
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "commit_message=${{ github.event.head_commit.message }}" >> $GITHUB_OUTPUT
+          echo "commit_author=${{ github.event.head_commit.author.name }}" >> $GITHUB_OUTPUT
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install anthropic
+
+      - name: Process changes with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python .github/scripts/process_with_claude.py \
+            --files "${{ steps.changed-files.outputs.files }}" \
+            --commit-message "${{ steps.changed-files.outputs.commit_message }}" \
+            --commit-author "${{ steps.changed-files.outputs.commit_author }}" \
+            --repo "${{ github.repository }}" \
+            --commit-sha "${{ github.sha }}"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: claude-processing-results
+          path: claude_output.json
+          retention-days: 30
