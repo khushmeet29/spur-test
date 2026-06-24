@@ -1,0 +1,55 @@
+# 🚀 Spur GitHub Actions Workflow
+name: Trigger Spur Webhook on Pull Request 🔔!
+
+on:
+    pull_request:
+        branches:
+            - ext/spur/github
+
+jobs:
+    trigger_webhook:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: 📡 Curl Request to Trigger TestPlans on Spur
+              run: |
+                  curl -X POST \
+                  -H "Content-Type: application/json" \
+                  -H "spur-github-key: U2FsdGVkX1+RLfOq6OhEp+wU0O6y+wNneNajWYjt7tHRjfDvPfGtW5gzNiFiLc21" \
+                  -H "sha: ${{ github.sha }}" \
+                  -H "repo: ${{ github.repository }}" \
+                  "https://app.spurtest.com/api/webhook/github" \
+                  -o response.txt -w "%{http_code}" > status.txt 2>&1 &
+                  CURL_PID=$!
+                  timeout=2400
+                  elapsed=0
+                  while kill -0 $CURL_PID 2>/dev/null; do
+                    if [ $elapsed -ge $timeout ]; then
+                      echo "Webhook trigger is still running after 40 minutes. Continuing..."
+                      break
+                    fi
+                    sleep 60 
+                    elapsed=$((elapsed+60))
+                    minutes=$((elapsed / 60))
+                    echo "Still waiting for response... (${minutes} minutes elapsed)"
+                    
+                    if [ -s response.txt ]; then
+                      echo "Response received. Checking status..."
+                      break
+                    fi
+                  done
+                  if [ -s status.txt ]; then
+                    STATUS=$(cat status.txt)
+                    if [ "$STATUS" = "200" ]; then
+                      echo "Webhook triggered successfully!"
+                    else
+                      echo "Webhook trigger status: $STATUS"
+                    fi
+                    cat response.txt
+                  else
+                    echo "Webhook trigger is still running. Check logs for final status."
+                  fi
+                  # Always exit successfully
+                  exit 0
+
+# 🎈 Happy testing with Spur! 🎈

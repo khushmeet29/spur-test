@@ -1,0 +1,263 @@
+name: Update PR Status and Generate Report
+
+on: status
+
+jobs:
+    update-pr-status-and-report:
+        if: github.event.context != 'CICD - All tests'
+        runs-on: ubuntu-latest
+        permissions:
+            pull-requests: write
+            statuses: write
+            contents: read
+
+        steps:
+            - name: Checkout Repository
+              uses: actions/checkout@v4
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Extract Owner and Repo
+              run: |
+                  IFS='/' read -r owner repo <<< "${{ github.repository }}"
+                  echo "OWNER=$owner" >> $GITHUB_ENV
+                  echo "REPO=$repo" >> $GITHUB_ENV
+
+            - name: Extract PR Number
+              run: |
+                  echo "Fetching PR for commit: ${{ github.event.commit.sha }}"
+                  pr=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                    "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.event.commit.sha }}/pulls" | \
+                    jq -r '[.[] | select(.state == "open")] | if length > 0 then .[0].number else empty end')
+
+                  if [ -n "$pr" ] && [ "$pr" != "null" ]; then
+                    echo "PR_NUMBER=$pr" >> $GITHUB_ENV
+                    echo "Found PR #$pr"
+                  else
+                    echo "No PR associated with this commit"
+                    echo "PR_NUMBER=" >> $GITHUB_ENV
+                  fi
+
+            - name: Collect All Statuses
+              run: |
+                  echo "Fetching statuses for commit: ${{ github.event.commit.sha }}"
+                  statuses=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                    "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.event.commit.sha }}/status")
+
+                  if echo "$statuses" | jq -e . >/dev/null 2>&1; then
+                    # Filter out our own summary status to avoid feedback loops
+                    filtered_statuses=$(echo "$statuses" | jq '
+                      .statuses = [.statuses[] | select(.context != "CICD - All tests")] |
+                      .total_count = (.statuses | length)
+                    ')
+                    
+                    echo 'STATUSES<<EOF' >> $GITHUB_ENV
+                    echo "$filtered_statuses" >> $GITHUB_ENV
+                    echo 'EOF' >> $GITHUB_ENV
+                    echo "Successfully fetched and filtered status data"
+                    
+                    # Debug: show what statuses we're actually processing
+                    echo "Processing statuses:"
+                    echo "$filtered_statuses" | jq -r '.statuses[] | "- " + .context + ": " + .state'
+                  else
+                    echo "Failed to fetch valid status data"
+                    exit 1
+                  fi
+
+            - name: Generate Report
+              run: |
+                  total_count=$(echo "$STATUSES" | jq '.total_count // 0')
+                  success_count=$(echo "$STATUSES" | jq '[.statuses[]? | select(.state == "success")] | length')
+                  failure_count=$(echo "$STATUSES" | jq '[.statuses[]? | select(.state == "failure")] | length')
+                  error_count=$(echo "$STATUSES" | jq '[.statuses[]? | select(.state == "error")] | length')
+                  pending_count=$(echo "$STATUSES" | jq '[.statuses[]? | select(.state == "pending")] | length')
+
+                  echo "Status counts - Total: $total_count, Success: $success_count, Failed: $failure_count, Error: $error_count, Pending: $pending_count"
+
+                  # Start building the report
+                  echo "## Spur CI/CD Report" > /tmp/report.md
+                  echo "" >> /tmp/report.md
+
+                  # Add status header
+                  failed_total=$((failure_count + error_count))
+                  if [ "$failed_total" -gt 0 ]; then
+                    echo "### ❌ Status: $failed_total test(s) failed, $success_count passed, $pending_count pending" >> /tmp/report.md
+                  elif [ "$pending_count" -gt 0 ]; then
+                    echo "### ⏳ Status: $pending_count test(s) still running, $success_count passed" >> /tmp/report.md
+                  else
+                    echo "### ✅ Status: All $success_count tests passed!" >> /tmp/report.md
+                  fi
+                  echo "" >> /tmp/report.md
+
+                  if [ "$total_count" -eq 0 ]; then
+                    echo "No status checks found for this commit." >> /tmp/report.md
+                  else
+                    # Create status table
+                    echo "| Test | Status | Details |" >> /tmp/report.md
+                    echo "|------|--------|----------|" >> /tmp/report.md
+                    
+                    # Process each status
+                    echo "$STATUSES" | jq -c '.statuses[]?' | while read -r line; do
+                      if [ -n "$line" ]; then
+                        context=$(echo "$line" | jq -r '.context // "Unknown"')
+                        state=$(echo "$line" | jq -r '.state // "unknown"')
+                        target_url=$(echo "$line" | jq -r '.target_url // "N/A"')
+                        description=$(echo "$line" | jq -r '.description // ""')
+                        
+                        # Clean up test name
+                        test_name=$(echo "$context" | sed 's/CICD - //')
+                        
+                        # Set status icon based on state
+                        case $state in
+                          "success") 
+                            status_icon="✅ **Passed**"
+                            ;;
+                          "failure") 
+                            status_icon="❌ **FAILED**"
+                            test_name="**$test_name**"
+                            ;;
+                          "error") 
+                            status_icon="🚫 **ERROR**"
+                            test_name="**$test_name**"
+                            ;;
+                          "pending") 
+                            status_icon="⏳ Running"
+                            ;;
+                          *) 
+                            status_icon="❓ Unknown"
+                            ;;
+                        esac
+                        
+                        # Build details cell
+                        if [ "$target_url" != "N/A" ] && [ "$target_url" != "null" ]; then
+                          if [ "$state" = "failure" ] || [ "$state" = "error" ]; then
+                            details_cell="[🔍 **View Failure Details**]($target_url)"
+                          else
+                            details_cell="[View Details]($target_url)"
+                          fi
+                          if [ -n "$description" ] && [ "$description" != "null" ]; then
+                            details_cell="$details_cell<br/>_$description_"
+                          fi
+                        else
+                          if [ -n "$description" ] && [ "$description" != "null" ]; then
+                            details_cell="$description"
+                          else
+                            details_cell="No details available"
+                          fi
+                        fi
+                        
+                        echo "| $test_name | $status_icon | $details_cell |" >> /tmp/report.md
+                      fi
+                    done
+                  fi
+
+                  # Add failure summary if needed
+                  if [ "$failed_total" -gt 0 ]; then
+                    echo "" >> /tmp/report.md
+                    echo "### 🚨 Failed Tests Summary" >> /tmp/report.md
+                    echo "" >> /tmp/report.md
+                    
+                    echo "$STATUSES" | jq -r '.statuses[]? | select(.state == "failure" or .state == "error") | "- **" + (.context | gsub("CICD - "; "")) + "**: " + (.description // "No description")' >> /tmp/report.md
+                    
+                    echo "" >> /tmp/report.md
+                    echo "📋 **Next Steps:**" >> /tmp/report.md
+                    echo "1. Click the **View Failure Details** links above to see specific error logs" >> /tmp/report.md
+                    echo "2. Fix the failing tests in your code" >> /tmp/report.md
+                    echo "3. Push your changes to re-run the tests" >> /tmp/report.md
+                  fi
+
+                  # Add timestamp
+                  echo "" >> /tmp/report.md
+                  echo "---" >> /tmp/report.md
+                  echo "_Last updated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> /tmp/report.md
+
+                  # Save the report to environment
+                  echo 'REPORT<<EOF' >> $GITHUB_ENV
+                  cat /tmp/report.md >> $GITHUB_ENV
+                  echo 'EOF' >> $GITHUB_ENV
+
+                  # Save counts for later steps
+                  echo "TOTAL_COUNT=$total_count" >> $GITHUB_ENV
+                  echo "SUCCESS_COUNT=$success_count" >> $GITHUB_ENV
+                  echo "FAILURE_COUNT=$failure_count" >> $GITHUB_ENV
+                  echo "ERROR_COUNT=$error_count" >> $GITHUB_ENV
+
+            - name: Check Overall Status
+              id: check_status
+              run: |
+                  failed_total=$((FAILURE_COUNT + ERROR_COUNT))
+                  echo "Checking overall status: $SUCCESS_COUNT passed, $failed_total failed, $TOTAL_COUNT total"
+
+                  if [ "$TOTAL_COUNT" -eq 0 ]; then
+                    echo "status=pending" >> $GITHUB_OUTPUT
+                    echo "message=Spur CI/CD - Waiting for test results..." >> $GITHUB_OUTPUT
+                  elif [ "$failed_total" -gt 0 ]; then
+                    echo "status=failure" >> $GITHUB_OUTPUT
+                    echo "message=Spur CI/CD - $failed_total test(s) failed (${SUCCESS_COUNT}/${TOTAL_COUNT} passed)" >> $GITHUB_OUTPUT
+                  elif [ "$SUCCESS_COUNT" -eq "$TOTAL_COUNT" ]; then
+                    echo "status=success" >> $GITHUB_OUTPUT
+                    echo "message=Spur CI/CD - All tests passed! ✅" >> $GITHUB_OUTPUT
+                  else
+                    echo "status=pending" >> $GITHUB_OUTPUT
+                    echo "message=Spur CI/CD - Tests in progress (${SUCCESS_COUNT}/${TOTAL_COUNT} completed)" >> $GITHUB_OUTPUT
+                  fi
+
+            - name: Update or Create Comment
+              if: env.PR_NUMBER != '' && env.PR_NUMBER != null
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  echo "Updating PR #$PR_NUMBER with report"
+
+                  # Look for existing comment using REST API to get numeric IDs
+                  existing_comment=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+                    -H "Accept: application/vnd.github.v3+json" \
+                    "https://api.github.com/repos/${{ github.repository }}/issues/$PR_NUMBER/comments?per_page=100" | \
+                    jq -r '[.[] | select(.body | startswith("## Spur CI/CD Report"))] | last | .id // empty')
+
+                  if [ -n "$existing_comment" ]; then
+                    echo "Updating existing comment #$existing_comment"
+                    response=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $GITHUB_TOKEN" \
+                      -H "Accept: application/vnd.github.v3+json" \
+                      -H "Content-Type: application/json" \
+                      -X PATCH \
+                      "https://api.github.com/repos/${{ github.repository }}/issues/comments/$existing_comment" \
+                      -d "{\"body\": $(echo "$REPORT" | jq -Rs .)}")
+                    http_code=$(echo "$response" | tail -n1)
+                    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+                      echo "Comment updated successfully"
+                    else
+                      echo "Failed to update comment (HTTP $http_code), creating new one instead"
+                      echo "$REPORT" | gh pr comment $PR_NUMBER --body-file -
+                      echo "New comment created as fallback"
+                    fi
+                  else
+                    echo "Creating new comment"
+                    echo "$REPORT" | gh pr comment $PR_NUMBER --body-file -
+                    echo "New comment created"
+                  fi
+
+            - name: Set Final Status
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  status="${{ steps.check_status.outputs.status }}"
+                  message="${{ steps.check_status.outputs.message }}"
+
+                  echo "Setting final status: $status - $message"
+
+                  # Only set the summary status if we have actual test results to summarize
+                  if [ "$TOTAL_COUNT" -gt 0 ]; then
+                    curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+                      -H "Accept: application/vnd.github.v3+json" \
+                      -X POST \
+                      "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.event.commit.sha }}" \
+                      -d "{
+                        \"state\": \"$status\",
+                        \"context\": \"CICD - All tests\",
+                        \"description\": \"$message\"
+                      }"
+                    echo "Summary status set successfully"
+                  else
+                    echo "No test statuses found, skipping summary status"
+                  fi
